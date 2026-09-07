@@ -1,217 +1,257 @@
 #!/usr/bin/env python3
-"""W6 — Beacon Flood / SSID-Confusion Analysis. Detect beacon floods and BSSID churn."""
+"""W6 — Beacon Flood / SSID-Confusion Analysis.
 
-import csv
-import io
-import math
+Byte-level 802.11 beacon engineering + flood/churn/confusion detection.
+Builds a synthetic beacon corpus offscreen (frame_core), parses each frame
+byte-exact, then detects beacon flood rates, BSSID churn, whitelist validity,
+and SSID confusion.
+
+No radio emitted: beacons are synthesized and parsed on the host CPU.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
 import sys
-import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 
+try:
+    from firmware import frame_core as fc
+except ImportError:
+    try:
+        import frame_core as fc
+    except ImportError:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "firmware"))
+        import frame_core as fc
 
-def _parse_beacon_frame(raw_bytes):
-    """Parse a beacon frame from raw 802.11 bytes (simplified)."""
-    if len(raw_bytes) < 36:
-        return None
-    frame_type = (raw_bytes[0] >> 2) & 0x03
-    subtype = (raw_bytes[0] >> 4) & 0x0F
-    bssid = ":".join(f"{b:02x}" for b in raw_bytes[10:16])
-    timestamp = int.from_bytes(raw_bytes[24:32], "little")
-    beacon_interval = int.from_bytes(raw_bytes[32:34], "little")
-    capability = int.from_bytes(raw_bytes[34:36], "little")
-    ssid = ""
-    idx = 36
-    while idx < len(raw_bytes) - 2:
-        elem_id = raw_bytes[idx]
-        elem_len = raw_bytes[idx + 1] if idx + 1 < len(raw_bytes) else 0
-        if elem_id == 0:
-            ssid = raw_bytes[idx + 2:idx + 2 + elem_len].decode("utf-8", errors="replace")
-        idx += 2 + elem_len
-    return {
-        "frame_type": frame_type,
-        "subtype": subtype,
-        "bssid": bssid,
-        "timestamp": timestamp,
-        "beacon_interval": beacon_interval,
-        "capability": capability,
-        "ssid": ssid,
-    }
+# ----------------------------------------------------------------------
+# Synthetic beacon corpus: (bssid, ssid, channel, rssi, type, ts_ms)
+# type "real" = allowlisted legitimate AP; "fake" = flood-generated clone
+# ----------------------------------------------------------------------
 
-
-EMBEDDED_BEACON_FRAMES = [
-    {"ts": 0.000, "bssid": "aa:bb:cc:dd:ee:01", "ssid": "CorpWiFi", "rssi": -35, "channel": 1, "type": "real"},
-    {"ts": 0.001, "bssid": "aa:bb:cc:dd:ee:02", "ssid": "CorpWiFi", "rssi": -36, "channel": 1, "type": "fake"},
-    {"ts": 0.002, "bssid": "aa:bb:cc:dd:ee:03", "ssid": "CorpWiFi", "rssi": -37, "channel": 1, "type": "fake"},
-    {"ts": 0.003, "bssid": "aa:bb:cc:dd:ee:04", "ssid": "CorpWiFi", "rssi": -38, "channel": 1, "type": "fake"},
-    {"ts": 0.004, "bssid": "aa:bb:cc:dd:ee:05", "ssid": "CorpWiFi", "rssi": -39, "channel": 1, "type": "fake"},
-    {"ts": 0.005, "bssid": "aa:bb:cc:dd:ee:06", "ssid": "CorpWiFi", "rssi": -40, "channel": 1, "type": "fake"},
-    {"ts": 0.006, "bssid": "aa:bb:cc:dd:ee:07", "ssid": "CorpWiFi", "rssi": -41, "channel": 1, "type": "fake"},
-    {"ts": 0.007, "bssid": "aa:bb:cc:dd:ee:08", "ssid": "CorpWiFi", "rssi": -42, "channel": 1, "type": "fake"},
-    {"ts": 0.008, "bssid": "aa:bb:cc:dd:ee:09", "ssid": "CorpWiFi", "rssi": -43, "channel": 1, "type": "fake"},
-    {"ts": 0.009, "bssid": "aa:bb:cc:dd:ee:0a", "ssid": "CorpWiFi", "rssi": -44, "channel": 1, "type": "fake"},
-    {"ts": 0.010, "bssid": "aa:bb:cc:dd:ee:0b", "ssid": "CorpWiFi", "rssi": -45, "channel": 1, "type": "fake"},
-    {"ts": 0.011, "bssid": "aa:bb:cc:dd:ee:0c", "ssid": "CorpWiFi", "rssi": -46, "channel": 1, "type": "fake"},
-    {"ts": 0.012, "bssid": "aa:bb:cc:dd:ee:0d", "ssid": "CorpWiFi", "rssi": -47, "channel": 1, "type": "fake"},
-    {"ts": 0.013, "bssid": "aa:bb:cc:dd:ee:0e", "ssid": "CorpWiFi", "rssi": -48, "channel": 1, "type": "fake"},
-    {"ts": 0.014, "bssid": "aa:bb:cc:dd:ee:0f", "ssid": "CorpWiFi", "rssi": -49, "channel": 1, "type": "fake"},
-    {"ts": 0.015, "bssid": "aa:bb:cc:dd:ee:10", "ssid": "CorpWiFi", "rssi": -50, "channel": 1, "type": "fake"},
-    {"ts": 0.016, "bssid": "aa:bb:cc:dd:ee:11", "ssid": "GuestNet", "rssi": -55, "channel": 6, "type": "real"},
-    {"ts": 0.017, "bssid": "aa:bb:cc:dd:ee:12", "ssid": "GuestNet", "rssi": -56, "channel": 6, "type": "fake"},
-    {"ts": 0.018, "bssid": "aa:bb:cc:dd:ee:13", "ssid": "GuestNet", "rssi": -57, "channel": 6, "type": "fake"},
-    {"ts": 0.019, "bssid": "aa:bb:cc:dd:ee:14", "ssid": "GuestNet", "rssi": -58, "channel": 6, "type": "fake"},
-    {"ts": 0.020, "bssid": "aa:bb:cc:dd:ee:15", "ssid": "GuestNet", "rssi": -59, "channel": 6, "type": "fake"},
-    {"ts": 0.021, "bssid": "aa:bb:cc:dd:ee:16", "ssid": "GuestNet", "rssi": -60, "channel": 6, "type": "fake"},
-    {"ts": 0.022, "bssid": "aa:bb:cc:dd:ee:17", "ssid": "GuestNet", "rssi": -61, "channel": 6, "type": "fake"},
-    {"ts": 0.023, "bssid": "aa:bb:cc:dd:ee:18", "ssid": "GuestNet", "rssi": -62, "channel": 6, "type": "fake"},
-    {"ts": 0.024, "bssid": "aa:bb:cc:dd:ee:19", "ssid": "GuestNet", "rssi": -63, "channel": 6, "type": "fake"},
-    {"ts": 0.025, "bssid": "aa:bb:cc:dd:ee:1a", "ssid": "GuestNet", "rssi": -64, "channel": 6, "type": "fake"},
-    {"ts": 0.026, "bssid": "aa:bb:cc:dd:ee:1b", "ssid": "GuestNet", "rssi": -65, "channel": 6, "type": "fake"},
-    {"ts": 0.027, "bssid": "aa:bb:cc:dd:ee:1c", "ssid": "HomeWiFi", "rssi": -42, "channel": 11, "type": "real"},
-    {"ts": 0.028, "bssid": "aa:bb:cc:dd:ee:1d", "ssid": "HomeWiFi", "rssi": -43, "channel": 11, "type": "fake"},
-    {"ts": 0.029, "bssid": "aa:bb:cc:dd:ee:1e", "ssid": "HomeWiFi", "rssi": -44, "channel": 11, "type": "fake"},
-    {"ts": 0.030, "bssid": "aa:bb:cc:dd:ee:1f", "ssid": "HomeWiFi", "rssi": -45, "channel": 11, "type": "fake"},
-    {"ts": 0.031, "bssid": "aa:bb:cc:dd:ee:20", "ssid": "HomeWiFi", "rssi": -46, "channel": 11, "type": "fake"},
+CORPUS = [
+    ("00:11:22:33:44:01", "lab-corpwifi", 1, -35, "real", 0),
+    *[(f"00:11:22:33:44:{i:02x}", "lab-corpwifi", 1, -36 - (i - 2), "fake", i) for i in range(2, 17)],
+    ("00:11:22:33:44:19", "lab-guest", 6, -55, "real", 16),
+    *[(f"00:11:22:33:44:{i:02x}", "lab-guest", 6, -56 - (i - 26), "fake", i) for i in range(26, 39)],
+    ("00:11:22:33:44:40", "lab-home", 11, -42, "real", 39),
+    *[(f"00:11:22:33:44:{i:02x}", "lab-home", 11, -43 - (i - 57), "fake", i) for i in range(57, 69)],
 ]
 
 KNOWN_WHITELIST = {
-    "aa:bb:cc:dd:ee:01": "CorpWiFi",
-    "aa:bb:cc:dd:ee:11": "GuestNet",
-    "aa:bb:cc:dd:ee:1c": "HomeWiFi",
+    "00:11:22:33:44:01": "lab-corpwifi",
+    "00:11:22:33:44:19": "lab-guest",
+    "00:11:22:33:44:40": "lab-home",
 }
 
 
+def build_beacon_corpus():
+    """Build byte-exact beacon frames from the corpus records."""
+    frames = []
+    for (bssid, ssid, channel, rssi, kind, tms) in CORPUS:
+        beacon = fc.build_beacon(bssid, ssid=ssid, timestamp=tms * 100,
+                                 beacon_interval=100, seq_num=(tms + 1) % 4096)
+        beacon += fc.fcs(beacon)
+        frames.append({"ts": tms / 1000.0, "bssid": bssid, "ssid": ssid,
+                       "channel": channel, "rssi": rssi, "type": kind,
+                       "data": beacon})
+    return frames
+
+
+def parse_beacon_bytes(data: bytes) -> dict:
+    """Parse a raw beacon (strip FCS) via frame_core, byte-exact."""
+    if fc.verify_fcs(data):
+        data = data[:-4]
+    fields, _ies = fc.parse_beacon(data)
+    return fields
+
+
+def write_beacon_pcap(frames: list[dict], path: str) -> int:
+    fc.write_pcap(path, [f["data"] for f in frames], ts=frames[0]["ts"])
+    return len(frames)
+
+
+def read_beacon_pcap(path: str) -> list[dict]:
+    out = []
+    for rec in fc.read_pcap(path):
+        data = rec["data"]
+        try:
+            fields = parse_beacon_bytes(data)
+            if fields["subtype_val"] != fc.FC_SUBTYPE_BEACON:
+                out.append({"kind": "ignored", "ts": rec["ts"]})
+                continue
+            out.append({"kind": "beacon", "bssid": fields["bssid"],
+                        "ssid": fields["ssid"] or "", "seq": fields["seq_num"],
+                        "interval": fields["beacon_interval"], "ts": rec["ts"]})
+        except ValueError:
+            out.append({"kind": "unknown", "ts": rec["ts"]})
+    return out
+
+
+# ----------------------------------------------------------------------
+# Analysis
+# ----------------------------------------------------------------------
+
+
 def compute_bssid_churn(frames, window_sec=1.0):
-    """Compute BSSID churn rate (new BSSIDs per minute) across time windows."""
-    if not frames:
-        return []
     windows = defaultdict(set)
     for f in frames:
         bucket = int(f["ts"] // window_sec)
         windows[bucket].add(f["bssid"])
-    seen_total = set()
+    seen = set()
     churn = []
     for bucket in sorted(windows.keys()):
-        new_bssids = windows[bucket] - seen_total
-        seen_total |= windows[bucket]
-        churn.append({
-            "window": bucket,
-            "new_bssids": len(new_bssids),
-            "total_bssids": len(seen_total),
-            "bssids_in_window": len(windows[bucket]),
-        })
+        new = windows[bucket] - seen
+        seen |= windows[bucket]
+        churn.append({"window": bucket, "new_bssids": len(new),
+                      "total_bssids": len(seen), "bssids_in_window": len(windows[bucket])})
     return churn
 
 
-def detect_flood(frames, threshold_bssid_per_sec=5):
-    """Detect beacon flood based on BSSID rate threshold."""
+def detect_flood(frames, threshold_per_sec=5):
     if not frames:
         return False, 0.0
-    duration = frames[-1]["ts"] - frames[0]["ts"] if len(frames) > 1 else 1.0
-    unique_bssids = len(set(f["bssid"] for f in frames))
-    rate = unique_bssids / max(duration, 0.001)
-    return rate > threshold_bssid_per_sec, rate
+    duration = (frames[-1]["ts"] - frames[0]["ts"]) if len(frames) > 1 else 1.0
+    unique = len(set(f["bssid"] for f in frames))
+    rate = unique / max(duration, 0.001)
+    return rate > threshold_per_sec, rate
 
 
 def validate_whitelist(frames, whitelist):
-    """Validate which real APs from the whitelist appeared correctly."""
-    present_bssids = set(f["bssid"] for f in frames)
-    results = []
+    present = {f["bssid"] for f in frames}
+    out = []
     for bssid, ssid in whitelist.items():
-        if bssid in present_bssids:
-            appearances = sum(1 for f in frames if f["bssid"] == bssid)
-            results.append({"bssid": bssid, "ssid": ssid, "status": "FOUND", "count": appearances})
-        else:
-            results.append({"bssid": bssid, "ssid": ssid, "status": "MISSING", "count": 0})
-    return results
+        found = bssid in present
+        out.append({"bssid": bssid, "ssid": ssid,
+                    "status": "FOUND" if found else "MISSING",
+                    "count": sum(1 for f in frames if f["bssid"] == bssid)})
+    return out
 
 
 def compute_ssid_confusion(frames):
-    """Detect SSID confusion: same SSID broadcast by many BSSIDs."""
-    ssid_bssid_map = defaultdict(set)
+    mapping = defaultdict(set)
     for f in frames:
-        ssid_bssid_map[f["ssid"]].add(f["bssid"])
-    results = []
-    for ssid, bssids in ssid_bssid_map.items():
-        results.append({
-            "ssid": ssid,
-            "bssid_count": len(bssids),
-            "is_flood": len(bssids) > 3,
-        })
-    return results
+        mapping[f["ssid"]].add(f["bssid"])
+    return [{"ssid": ssid, "bssid_count": len(bssids), "is_flood": len(bssids) > 3}
+            for ssid, bssids in mapping.items()]
 
 
-class BeaconAnalyzer:
-    """Beacon flood detection and SSID-confusion analysis suite."""
-
-    def __init__(self, frames=None):
-        self.frames = frames or EMBEDDED_BEACON_FRAMES
-        self.churn = []
-        self.flood_detected = False
-        self.flood_rate = 0.0
-        self.whitelist_results = []
-        self.ssid_confusion = []
-
-    def analyze(self):
-        """Run the complete beacon analysis."""
-        print("=" * 60)
-        print("  W6 — Beacon Flood / SSID-Confusion Analysis")
-        print("=" * 60)
-
-        print(f"\n[+] Loaded {len(self.frames)} beacon frames")
-
-        unique_bssids = set(f["bssid"] for f in self.frames)
-        unique_ssids = set(f["ssid"] for f in self.frames)
-        print(f"[+] Unique BSSIDs: {len(unique_bssids)}")
-        print(f"[+] Unique SSIDs: {len(unique_ssids)}")
-
-        real_count = sum(1 for f in self.frames if f["type"] == "real")
-        fake_count = sum(1 for f in self.frames if f["type"] == "fake")
-        print(f"[+] Real beacons: {real_count}, Fake beacons: {fake_count}")
-
-        self.churn = compute_bssid_churn(self.frames, window_sec=0.01)
-        self.flood_detected, self.flood_rate = detect_flood(self.frames)
-
-        print("\n=== BSSID Churn Rate ===")
-        print(f"{'Window':>8} {'New BSSIDs':>12} {'Total Seen':>12} {'In Window':>10}")
-        print("-" * 45)
-        for entry in self.churn:
-            print(f"{entry['window']:>8} {entry['new_bssids']:>12} {entry['total_bssids']:>12} {entry['bssids_in_window']:>10}")
-
-        print(f"\n=== Flood Detection ===")
-        print(f"  Flood detected: {'YES' if self.flood_detected else 'NO'}")
-        print(f"  BSSID rate: {self.flood_rate:.1f} new BSSIDs/sec")
-        print(f"  Threshold: 5 BSSIDs/sec")
-
-        self.whitelist_results = validate_whitelist(self.frames, KNOWN_WHITELIST)
-        print("\n=== Whitelist Validation ===")
-        print(f"{'BSSID':<20} {'SSID':<15} {'Status':<10} {'Count':>5}")
-        print("-" * 52)
-        for wr in self.whitelist_results:
-            print(f"{wr['bssid']:<20} {wr['ssid']:<15} {wr['status']:<10} {wr['count']:>5}")
-
-        self.ssid_confusion = compute_ssid_confusion(self.frames)
-        print("\n=== SSID Confusion Detection ===")
-        print(f"{'SSID':<15} {'BSSID Count':>12} {'Flood?':>8}")
-        print("-" * 38)
-        for sc in self.ssid_confusion:
-            flag = "YES" if sc["is_flood"] else "no"
-            print(f"{sc['ssid']:<15} {sc['bssid_count']:>12} {flag:>8}")
-
-        print("\n=== IDS Rule Suggestions ===")
-        if self.flood_detected:
-            print(f"  ALERT beacon_flood: ssid=\"*\" rate>{self.flood_rate:.0f}/sec over threshold")
-        for sc in self.ssid_confusion:
-            if sc["is_flood"]:
-                print(f"  ALERT ssid_confusion: ssid=\"{sc['ssid']}\" bssid_count={sc['bssid_count']} > 3")
-        print("[+] Analysis complete — exit 0")
-        return self
+def analyze(frames) -> dict:
+    churn = compute_bssid_churn(frames, window_sec=1.0)
+    flood, rate = detect_flood(frames)
+    whitelist = validate_whitelist(frames, KNOWN_WHITELIST)
+    confusion = compute_ssid_confusion(frames)
+    rules = []
+    if flood:
+        rules.append({"alert": "beacon_flood", "cond": f"rate>{rate:.1f}/sec"})
+    for sc in confusion:
+        if sc["is_flood"]:
+            rules.append({"alert": "ssid_confusion", "ssid": sc["ssid"],
+                          "bssid_count": sc["bssid_count"]})
+    return {
+        "name": "w6-beacon-analysis",
+        "radio_emitted": False,
+        "total_frames": len(frames),
+        "unique_bssids": len({f["bssid"] for f in frames}),
+        "unique_ssids": len({f["ssid"] for f in frames}),
+        "real_count": sum(1 for f in frames if f["type"] == "real"),
+        "fake_count": sum(1 for f in frames if f["type"] == "fake"),
+        "churn": churn,
+        "flood_detected": flood,
+        "flood_rate": round(rate, 1),
+        "whitelist_validation": whitelist,
+        "ssid_confusion": confusion,
+        "ids_rules": rules,
+    }
 
 
-def main():
-    analyzer = BeaconAnalyzer()
-    analyzer.analyze()
+def build_args_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="w6-beacon-analysis",
+        description="Beacon flood / SSID-confusion analysis over byte-exact 802.11 beacons "
+                    "(pure-stdlib bytes; offline; no radio).")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--source", choices=["synthetic", "pcap"], default="synthetic")
+    p.add_argument("--pcap", metavar="PATH")
+    p.add_argument("--write-pcap", metavar="PATH")
+    p.add_argument("--json", metavar="PATH")
+    return p
+
+
+def run_beacon_analysis(source, pcap_path):
+    if source == "pcap":
+        if not pcap_path or not os.path.exists(pcap_path):
+            raise FileNotFoundError(pcap_path)
+        rows = read_beacon_pcap(pcap_path)
+        frames = [{"ts": r["ts"], "bssid": r["bssid"], "ssid": r["ssid"] or "<hidden>",
+                   "channel": 0, "rssi": 0, "type": "pcap", "data": b""}
+                  for r in rows if r["kind"] == "beacon"]
+        origin = f"pcap:{pcap_path}"
+    else:
+        frames = build_beacon_corpus()
+        origin = "byte-exact beacon builders"
+    result = analyze(frames)
+    result["origin"] = origin
+    return result
+
+
+def print_report(result: dict) -> None:
+    print("=" * 66)
+    print("W6 — Beacon Flood / SSID-Confusion Analysis")
+    print("=" * 66)
+    print(f"\n[+] Source: {result['origin']}   (radio_emitted=False)")
+    print(f"[+] Beacons: {result['total_frames']}  Unique BSSIDs: {result['unique_bssids']}  "
+          f"SSIDs: {result['unique_ssids']}")
+    print(f"[+] Real: {result['real_count']}  Flood-clone: {result['fake_count']}\n")
+
+    print("--- Flood Detection ---")
+    print(f"  Flood detected: {'YES' if result['flood_detected'] else 'NO'}")
+    print(f"  BSSID rate: {result['flood_rate']:.1f} new BSSIDs/sec (threshold 5)")
+
+    print("\n--- Whitelist Validation ---")
+    for wr in result["whitelist_validation"]:
+        print(f"  {wr['status']:<7} {wr['bssid']}  {wr['ssid']}  (seen {wr['count']}x)")
+
+    print("\n--- SSID Confusion ---")
+    for sc in result["ssid_confusion"]:
+        flag = "YES" if sc["is_flood"] else "no"
+        print(f"  {sc['ssid']:<16} {sc['bssid_count']:>3d} BSSIDs  flood={flag}")
+
+    print("\n--- IDS Rule Suggestions ---")
+    if not result["ids_rules"]:
+        print("  (none)")
+    for r in result["ids_rules"]:
+        print(f"  ALERT {r['alert']}: {r.get('cond', r.get('ssid', ''))}")
+
+    print("\nOffline analysis complete — no radio emitted.")
+    print("=" * 66)
+
+
+def main(argv=None) -> int:
+    args = build_args_parser().parse_args(argv)
+    try:
+        result = run_beacon_analysis(args.source, args.pcap)
+    except FileNotFoundError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    print_report(result)
+    if args.write_pcap:
+        n = write_beacon_pcap(build_beacon_corpus(), args.write_pcap)
+        print(f"\n[+] beacon corpus -> {args.write_pcap} ({n} frames)")
+    if args.json:
+        d = os.path.dirname(args.json)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(args.json, "w") as f:
+            json.dump(result, f, indent=2, default=str)
     return 0
 
 
+def run_demo() -> int:
+    return main(["--source", "synthetic"])
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())

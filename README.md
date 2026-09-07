@@ -115,7 +115,7 @@ This project is provided for **educational and authorized security testing purpo
 - Flooding beacons on networks you don't own
 - Disrupting wireless networks with fake SSIDs
 - Any activity that violates applicable laws or regulations
-- Commercial use without proper licensing
+- Operating an intentional radiator outside FCC/regulatory limits
 
 ### No Warranty
 This software is provided "AS IS" without warranty of any kind. The author is not responsible for any misuse or damage caused by this software.
@@ -125,6 +125,35 @@ If you discover network vulnerabilities using this tool, follow responsible disc
 1. Report to the network owner privately
 2. Allow reasonable time for remediation
 3. Do not exploit beyond proof of concept
+
+## Live Lab Test Plan
+
+This repo is a byte-level engine + simulation tool: beacons are *synthesized* offscreen and
+parsed byte-exact — no capture, no radio.
+
+Offline (this repo, no radio):
+1. `python3 firmware/beacon_analysis.py --source synthetic --json reports/w6.json` — build the
+   synthetic flood corpus, run flood/churn/whitelist/SSID-confusion analysis (exit 0).
+2. `python3 -m unittest discover -s tests` — byte-exact unit tests pass (exit 0).
+3. `python3 firmware/beacon_analysis.py --write-pcap reports/b.pcap` then re-run with
+   `--source pcap --pcap reports/b.pcap` — confirm identical results (deterministic).
+
+Authorized lab (only with owner's written scope, shield/Faraday, authorized channel):
+4. Transmit the exact beacon bytes the tool prints in a shielded enclosure and confirm a lab
+   monitor (e.g., w7-wids-sensor) flags the flood and SSID confusion.
+5. `green = permitted`: any radiated beacon flood requires written lab authorization, an
+   air-gapped/shielded bench, and an authorized channel.
+
+## Metrics
+
+- Frame type engineered byte-exact: beacon (subtype 8) with SSID + rates + timestamp/interval/capability
+- Synthetic corpus: 3 SSIDs, 1 real AP + flood-clones per SSID (34 frames)
+- Detection: BSSID churn, flood rate (threshold 5/s), whitelist validation, SSID-confusion (>3 BSSIDs)
+- IDS rule generation: `beacon_flood`, `ssid_confusion`
+- pcap write/read round-trip: synthetic corpus -> fixture -> identical parse
+
+- Test suite: `python3 -m unittest discover -s tests`
+- Reports: `reports/` (gitignored)
 
 ## License
 
